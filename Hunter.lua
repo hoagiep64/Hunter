@@ -331,11 +331,6 @@ windower.register_event('addon command', function(cmd, ...)
         config.save(settings)
         windower.add_to_chat(200, 'Hunter: Tracker display ' .. (settings.display and 'enabled.' or 'disabled.'))
 
-    elseif cmd == 'table' then
-        settings.table_display = not settings.table_display
-        config.save(settings)
-        windower.add_to_chat(200, 'Hunter: Table display ' .. (settings.table_display and 'enabled.' or 'disabled.'))
-
     elseif cmd == '?' then
         windower.add_to_chat(123, 'Hunter Commands:')
 		windower.add_to_chat(123, '//hunter     	 - Begin/Stop hunt loop')
@@ -345,7 +340,6 @@ windower.register_event('addon command', function(cmd, ...)
         windower.add_to_chat(123, '//hunter track    - (t) Track target ID temporarily')
         windower.add_to_chat(123, '//hunter clear    - (c) Clear tracked list')
         windower.add_to_chat(123, '//hunter display  - (d) Toggle small overlay')
-        windower.add_to_chat(123, '//hunter table    - Toggle prey table overlay')
     end
 end)
 ---------
