@@ -2,7 +2,7 @@
 
 _addon.name = 'Hunter'
 _addon.author = 'Paulu'
-_addon.version = '1.1'
+_addon.version = '1.0'
 _addon.commands = {'hunter','hunt'}
 
 local logger = require('logger')
@@ -15,10 +15,10 @@ local texts = require('texts')
 --============================--
 local defaults = {
     display = true,
-    pos_x = 300,
-    pos_y = 250,
-    table_display = false,
-    table_pos_x = 700,
+    pos_x = 200,
+    pos_y = 200,
+    table_display = true,
+    table_pos_x = 300,
     table_pos_y = 100
 }
 
@@ -27,20 +27,19 @@ local settings = config.load(defaults)
 --============================--
 -- Prey and Tracker Variables
 --============================--
-local last_display_update = 0
 local prey = {}
-local prey_count = 1
+local prey_count = 4
 local current_index = 1
 local TheHuntIsOn = false
 local tracked_ids = {}
-local hunt_range = 2.5
-local camp_range = 20
+local hunt_range = 14
+local point_a = nil
+local point_b = nil
+local prowl_active = false
 local current_target_point = nil
-local stuck_check = {
-    previous_dist = nil,
-    stuck_cycles = 0,
-    is_strafing = false
-}
+local camp_point = nil
+local camp_range = 30
+local is_camped = false
 
 --============================--
 -- Color Codes
@@ -49,22 +48,22 @@ local COLOR_GREEN   = "\\cs(0,255,0)"
 local COLOR_RED     = "\\cs(255,0,0)"
 local COLOR_PURPLE  = "\\cs(180,80,250)"
 local COLOR_WHITE   = "\\cs(255,255,255)"
-local COLOR_RESET   = "\\cr"
+local COLOR_RESET   = ""
 
 --============================--
 -- Text Displays
 --============================--
 local tracker_display = texts.new({
-    pos = {x = settings.pos_x, y = settings.pos_y},
-    text = {font = 'Consolas', size = 11, alpha = 255},
+    pos = {x = 100, y = 400},
+    text = {font = 'Consolas', size = 13, alpha = 255},
     flags = {draggable = true},
     bg = {alpha = 150, red = 0, green = 0, blue = 0},
     padding = 4,
 })
 
 local prey_display = texts.new({
-    pos = {x = settings.table_pos_x, y = settings.table_pos_y},
-    text = {font = 'Consolas', size = 11, alpha = 255},
+    pos = {x = 200, y = 200},
+    text = {font = 'Consolas', size = 13, alpha = 255},
     flags = {draggable = true},
     bg = {alpha = 180, red = 0, green = 0, blue = 0},
     padding = 4,
@@ -98,6 +97,9 @@ local function populate_prey_from_target()
     end
 
     prey = {}
+    for i = 1, prey_count do
+        prey[i] = mob.id + (i - 1)
+    end
 
     current_index = 1
     windower.add_to_chat(200, 'Hunter: Mark list populated from ID ' .. mob.id)
@@ -122,17 +124,24 @@ local function TargetEngage(target_id)
     end
 end
 
+
 local function HunterEngage()
-    local player_data = windower.ffxi.get_player()
-    local player = player_data and windower.ffxi.get_mob_by_id(player_data.id)
+    local player = windower.ffxi.get_player()
     if not player or player.status ~= 0 then return end
 
-        if valid and (not player.target_index or player.target_index ~= mob.index) then
-            TargetEngage(mob.id)
-            current_index = index % prey_count + 1
-            return
-        end
+    for i = 1, prey_count do
+        local index = ((current_index + i - 2) % prey_count) + 1
+        local mob_id = prey[index]
+        local mob = mob_id and windower.ffxi.get_mob_by_id(mob_id)
 
+        if mob and mob.valid_target and mob.hpp > 0 then
+            if not player.target_index or player.target_index ~= mob.index then
+                TargetEngage(mob.id)
+                current_index = index % prey_count + 1
+                return
+            end
+        end
+    end
 end
 
 local function maintain_position_and_facing()
@@ -172,7 +181,7 @@ local function check_for_nearby_threats()
 			local dist = math.sqrt(dx^2 + dy^2)
 			if dist <= shortest then
 				nearest = mob
-				shortest = dist				
+				shortest = dist
 			end
 		end
     end
@@ -183,12 +192,11 @@ local function check_for_nearby_threats()
             local dy = nearest.y - camp_point.y
             local camp_dist = math.sqrt(dx^2 + dy^2)
             if camp_dist > camp_range then
-                --windower.add_to_chat(123, 'Hunter: Skipped threat (outside camp range).')  -- Debugging
+                windower.add_to_chat(123, 'Hunter: Skipped threat (outside camp range).')
                 return false
             end
         end
-
-        TargetEngage(nearest.id)
+    TargetEngage(nearest.id)
         windower.add_to_chat(207, 'Hunter: Engaging nearby threat: '..nearest.name)
         return true
     end
@@ -199,87 +207,35 @@ end
 local function hunt_loop()
     coroutine.sleep(1)
     while TheHuntIsOn do
-        local player_data = windower.ffxi.get_player()
-		local player = player_data and windower.ffxi.get_mob_by_id(player_data.id)
+        local player = windower.ffxi.get_player()
         if player and player.status == 1 then
-
-            -- Stuck detection block
-            local mob = windower.ffxi.get_mob_by_target('t')
-            if mob and mob.x and mob.y then
-                local dx = mob.x - player.x
-                local dy = mob.y - player.y
-                local dist = math.sqrt(dx^2 + dy^2)
-
-                if dist > 3.5 then
-                    if stuck_check.previous_dist and math.abs(dist - stuck_check.previous_dist) < 0.1 then
-                        stuck_check.stuck_cycles = stuck_check.stuck_cycles + 1
-                    else
-                        stuck_check.stuck_cycles = 0
-                    end
-                    stuck_check.previous_dist = dist
-
-                    if stuck_check.stuck_cycles >= 1 and not stuck_check.is_strafing then
-                        stuck_check.is_strafing = true
-                        windower.send_command('setkey numpad4 down')
-                        coroutine.schedule(function()
-                            windower.send_command('setkey numpad4 up')
-                            stuck_check.is_strafing = false
-                            stuck_check.stuck_cycles = 0
-                            stuck_check.previous_dist = nil
-                        end, 1)
-                    end
-                else
-                    stuck_check.previous_dist = nil
-                    stuck_check.stuck_cycles = 0
-                end
-            end
-
             maintain_position_and_facing()
-
-        elseif player.status == 4 then
-            TheHuntIsOn = true
-            windower.send_command('hunt')
-
         elseif not check_for_nearby_threats() then
-            HunterEngage()
-        end
-
+			HunterEngage()
+		end
         coroutine.sleep(1.5)
     end
 end
 
-windower.register_event('zone change', function(new, old)
-    TheHuntIsOn = false
-end)
+local function prowl_loop()
+    
+end
 
 --============================--
 -- Display Updaters
 --============================--
-windower.register_event('prerender', function()
-    local clock_now = os.clock()
-    if clock_now - last_display_update < 1 then return end
-    last_display_update = clock_now
-
+windower.register_event('time change', function()
+    -- Tracked IDs overlay
     local now = os.time()
     local lines = {}
 
-	local current_target = windower.ffxi.get_mob_by_target('t')
-	local current_id = current_target and current_target.id
-
-	for id, entry in pairs(tracked_ids) do
-		local numeric_id = tonumber(id)
-
-		if now - entry.timestamp > 60 then
-			tracked_ids[id] = nil
-		else
-			if current_id and numeric_id == current_id then
-				-- Highlight only the mob you're targeting
-				table.insert(lines, "\\cs(255,255,0)" .. string.format("%s: %d", entry.name, numeric_id) .. COLOR_RESET)
-			else
-				table.insert(lines, string.format("%s: %d", entry.name, numeric_id))
-			end
-		end
-	end
+    for id, entry in pairs(tracked_ids) do
+        if now - entry.timestamp > 60 then
+            tracked_ids[id] = nil
+        else
+            table.insert(lines, string.format("%s: %d", entry.name, id))
+        end
+    end
 
     if settings.display and #lines > 0 then
         tracker_display:text(table.concat(lines, '\n'))
@@ -287,7 +243,6 @@ windower.register_event('prerender', function()
     else
         tracker_display:hide()
     end
-
 
     -- Prey table overlay
     if not settings.table_display then
@@ -307,32 +262,32 @@ windower.register_event('prerender', function()
     else
         table.insert(display_lines, COLOR_WHITE .. '-Hunter- Standing By' .. COLOR_RESET)
     end
-	table.insert(display_lines, COLOR_WHITE .. 'Hunting: ' .. hunt_range .. ' Yalms' .. COLOR_RESET)
+	table.insert(display_lines, COLOR_WHITE .. 'Range: ' .. hunt_range .. ' Yalms' .. COLOR_RESET)
 
-	if is_camped then
-		table.insert(display_lines,
-			string.format("%sCamping: %s yalms%s [%sCamping%s]",
-				COLOR_WHITE,
-				tostring(camp_range or "?"),
-				COLOR_RESET,
-				COLOR_GREEN,
-				COLOR_RESET
-			)
-		)
-	else
-		table.insert(display_lines,
-			string.format("%sCamping: %s yalms%s [%sNo Camp%s]",
-				COLOR_WHITE,
-				tostring(camp_range or "?"),
-				COLOR_RESET,
-				COLOR_RED,
-				COLOR_RESET
-			)
-		)
-	end
+    if is_camped then
+        table.insert(display_lines,
+            string.format("%sCamp Range: %s yalms%s [%sCamping%s]",
+                COLOR_WHITE,
+                tostring(camp_range or "?"),
+                COLOR_RESET,
+                COLOR_GREEN,
+                COLOR_RESET
+            )
+        )
+    else
+        table.insert(display_lines,
+            string.format("%sCamp Range: %s yalms%s [%sRoaming%s]",
+                COLOR_WHITE,
+                tostring(camp_range or "?"),
+                COLOR_RESET,
+                COLOR_RED,
+                COLOR_RESET
+            )
+        )
+    end
 
-	
-	for i = 1, #prey do
+
+    for i = 1, #prey do
         local mob = windower.ffxi.get_mob_by_id(prey[i])
         if mob then table.insert(valid_mobs, mob) end
     end
@@ -344,9 +299,12 @@ windower.register_event('prerender', function()
         table.insert(display_lines, string.format("%s%s: %d%s", color, mob.name, mob.id, COLOR_RESET))
     end
 
+    --if #valid_mobs > 0 then
         prey_display:text(table.concat(display_lines, '\n'))
         prey_display:show()
-
+    --else
+        --prey_display:hide()
+    --end
 end)
 
 --============================--
@@ -358,7 +316,7 @@ windower.register_event('addon command', function(cmd, ...)
 
     if not cmd or cmd == '' then
 		TheHuntIsOn = not TheHuntIsOn
-		windower.add_to_chat(200, 'Hunter: The hunt ' .. (TheHuntIsOn and 'is on!' or 'is called off.'))
+		windower.add_to_chat(200, 'Hunter: The hunt ' .. (TheHuntIsOn and 'is on!.' or 'is called off.'))
 
 		if TheHuntIsOn then
 			coroutine.schedule(hunt_loop, 0)
@@ -368,70 +326,79 @@ windower.register_event('addon command', function(cmd, ...)
 
     if tonumber(cmd) and tonumber(cmd) >= 1 and tonumber(cmd) <= 20 then
         prey_count = tonumber(cmd)
-		if windower.ffxi.get_mob_by_target('t') then
-			populate_prey_from_target()
-		end
         prey = {}
+        for i = 1, prey_count do prey[i] = nil end
+        windower.add_to_chat(200, 'Hunter: Prey list size set to ' .. prey_count)
+
+    elseif cmd == 'mark' or cmd == 'm' then
+        if prey_count == 0 then
+            windower.add_to_chat(123, 'Hunter: Set prey list size first.')
+        else
+            populate_prey_from_target()
+        end
 
     elseif cmd == 'hunt' then
         HunterEngage()
 		
-	elseif (cmd == 'range' or cmd == 'r' or cmd == 'rng' or cmd == 'hr') and tonumber(args[1]) then
+	elseif (cmd == 'range' or cmd == 'r' or cmd == 'rng') and tonumber(args[1]) then
 		local value = tonumber(args[1])
 		if value >= 1 and value <= 30 then
 			hunt_range = value
 			windower.add_to_chat(200, 'Hunter: Defensive detection range set to ' .. hunt_range .. ' yalms.')
 		else
-			windower.add_to_chat(123, 'Hunter: Please enter a number between 1 and 30.')
+			windower.add_to_chat(123, 'Hunter: Please enter a number between 1 and 25.')
 		end
 		
-    elseif cmd == 'track' or cmd == 't' then
+    
+    elseif cmd == 'camp' then
+        local p = windower.ffxi.get_mob_by_id(windower.ffxi.get_player().id)
+        if p then
+            camp_point = {x = p.x, y = p.y}
+            is_camped = true
+            windower.add_to_chat(200, 'Hunter: Camp point set.')
+        end
+
+    elseif cmd == 'break' then
+        camp_point = nil
+        is_camped = false
+        windower.add_to_chat(200, 'Hunter: Camp mode deactivated.')
+
+    elseif (cmd == 'camprange' or cmd == 'cr') and tonumber(args[1]) then
+        local value = tonumber(args[1])
+        if value >= 1 and value <= 40 then
+            camp_range = value
+            windower.add_to_chat(200, 'Hunter: Camp range set to ' .. camp_range .. ' yalms.')
+        else
+            windower.add_to_chat(123, 'Hunter: Enter a number between 1 and 40.')
+        end
+
+elseif cmd == 'track' or cmd == 't' then
         local mob = windower.ffxi.get_mob_by_target('t')
         if mob then
-            tracked_ids[tostring(mob.id)] = {name = mob.name, timestamp = os.time()}
+            tracked_ids[mob.id] = {name = mob.name, timestamp = os.time()}
             windower.add_to_chat(200, string.format("Hunter: Tracking %s (%d) for 1 minute.", mob.name, mob.id))
         else
             windower.add_to_chat(123, 'Hunter: No target selected.')
         end
 
-    
-    elseif cmd == 'camp' or cmd == 'c' then
-        local p = windower.ffxi.get_mob_by_id(windower.ffxi.get_player().id)
-        if p then
-            camp_point = {x = p.x, y = p.y}
-            is_camped = true
-            windower.add_to_chat(200, 'Hunter: Camp set at your current position.')
-        end
+    elseif cmd == 'clear' or  cmd == 'c' then
+        tracked_ids = {}
+        windower.add_to_chat(200, 'Hunter: Tracker display cleared.')
 
-    elseif cmd == 'break' or cmd == 'b' then
-        camp_point = nil
-        is_camped = false
-        windower.add_to_chat(200, 'Hunter: Camp cleared.')
-
-    elseif (cmd == 'camprange' or cmd == 'cr') and tonumber(args[1]) then
-        local val = tonumber(args[1])
-        if val >= 1 and val <= 40 then
-            camp_range = val
-            windower.add_to_chat(200, 'Hunter: Camp range set to ' .. camp_range .. ' yalms.')
-        else
-            windower.add_to_chat(123, 'Hunter: Camp range must be between 1 and 40.')
-        end
-    
-elseif cmd == 'display' or cmd =='d' then
-		settings.display = not settings.display
-		config.save(settings)
-		windower.add_to_chat(200, 'Hunter: Tracker display ' .. (settings.display and 'enabled.' or 'disabled.'))
+    elseif cmd == 'display' or cmd =='d' then
+        settings.table_display = not settings.table_display
+        config.save(settings)
+        windower.add_to_chat(200, 'Hunter: Tracker display ' .. (settings.display and 'enabled.' or 'disabled.'))
 
     elseif cmd == '?' then
         windower.add_to_chat(123, 'Hunter Commands:')
-		windower.add_to_chat(123, '//hunter OR //hunt - Begin/Stop hunt loop')
+		windower.add_to_chat(123, '//hunter     	 - Begin/Stop hunt loop')
         windower.add_to_chat(123, '//hunter <1-20> - Set prey list size')
-		windower.add_to_chat(123, '//hunter range <1-30> - (r #) Set auto-engage range')
-        windower.add_to_chat(123, '//hunter mark - (m) Plan prey list from target')
-        windower.add_to_chat(123, '//hunter track - (t) Track target ID temporarily')
-        windower.add_to_chat(123, '//hunter display - (d) Toggle small overlay')
-		windower.add_to_chat(123, '//hunter camprange <1-40> - (cr) Set maximum engage radius')
-		windower.add_to_chat(123, '//hunter camp - (c) Lock current position as camp')
+		windower.add_to_chat(123, '//hunter range <1-25> - (r #) Set auto-engage range')
+        windower.add_to_chat(123, '//hunter mark     - (m) Plan prey list from target')
+        windower.add_to_chat(123, '//hunter track    - (t) Track target ID temporarily')
+        windower.add_to_chat(123, '//hunter clear    - (c) Clear tracked list')
+        windower.add_to_chat(123, '//hunter display  - (d) Toggle small overlay')
     end
 end)
 ---------
