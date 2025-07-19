@@ -271,7 +271,7 @@ windower.register_event('time change', function()
                 tostring(camp_range or "?"),
                 COLOR_RESET,
                 COLOR_GREEN,
-                COLOR_RESET
+                COLOR_WHITE
             )
         )
     else
@@ -281,7 +281,7 @@ windower.register_event('time change', function()
                 tostring(camp_range or "?"),
                 COLOR_RESET,
                 COLOR_RED,
-                COLOR_RESET
+                COLOR_WHITE
             )
         )
     end
