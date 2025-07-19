@@ -192,7 +192,7 @@ local function check_for_nearby_threats()
             local dy = nearest.y - camp_point.y
             local camp_dist = math.sqrt(dx^2 + dy^2)
             if camp_dist > camp_range then
-                windower.add_to_chat(123, 'Hunter: Skipped threat (outside camp range).')
+                --windower.add_to_chat(123, 'Hunter: Skipped threat (outside camp range).')
                 return false
             end
         end
