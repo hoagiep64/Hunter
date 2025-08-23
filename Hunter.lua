@@ -1,8 +1,8 @@
--- Hunter Addon --
+-- Hunter Addon - Full Version with Prey Tracking and Overlay
 
 _addon.name = 'Hunter'
 _addon.author = 'Paulu'
-_addon.version = '1.0'
+_addon.version = '2.0.0'
 _addon.commands = {'hunter','hunt'}
 
 local logger = require('logger')
@@ -41,7 +41,7 @@ local current_target_point = nil
 local camp_point = nil
 local camp_range = 25
 local is_camped = false
-local tracking_active = true
+local tracking_active = false
 local last_update = 0
 
 --============================--
@@ -50,6 +50,22 @@ local last_update = 0
 local ret_active = false
 local start_position = {x=nil, y=nil}
 local returning = false
+
+--============================--
+-- Tunables (return controller)
+--============================--
+local ARRIVAL_RADIUS  = 1.5      -- stop when within this distance
+local START_RADIUS    = 3.0      -- only (re)start moving if beyond this distance
+local STOP_COOLDOWN   = 0.8      -- seconds we refuse to move after stopping
+local POLL_INTERVAL   = 0.05
+
+--============================--
+-- Internal movement state
+--============================--
+local movement_token = 0
+local last_stop_ts   = 0
+local moving_forward = false
+local reposition_running = false
 
 --============================--
 -- Color Codes
@@ -128,23 +144,6 @@ local function get_mob_color(mob, player_id)
     end
 end
 
-local function Reposition(start)
-    if start and start_position.x and start_position.y then
-        local player_body = windower.ffxi.get_mob_by_id(windower.ffxi.get_player().id)
-        if not player_body then return end
-
-        local angle = (math.atan2((start_position.y - player_body.y), (start_position.x - player_body.x)) * 180 / math.pi) * -1
-        local rads = angle:radian()
-
-        windower.ffxi.run(rads)
-        returning = true
-    else
-        windower.ffxi.run(false)
-        returning = false
-    end
-end
-
-
 --============================--
 -- Core Functions
 --============================--
@@ -183,7 +182,6 @@ local function TargetEngage(target_id)
     end
 end
 
-
 local function HunterEngage()
     local player = windower.ffxi.get_player()
     if not player or player.status ~= 0 then return end
@@ -204,7 +202,9 @@ local function HunterEngage()
 end
 
 local function maintain_position_and_facing()
-    local player = windower.ffxi.get_mob_by_id(windower.ffxi.get_player().id)
+    if reposition_running or returning then return end
+	
+	local player = windower.ffxi.get_mob_by_id(windower.ffxi.get_player().id)
     local target = windower.ffxi.get_mob_by_target('t')
     if not player or not target then return end
 
@@ -212,17 +212,23 @@ local function maintain_position_and_facing()
     local dy = target.y - player.y
     local distance = math.sqrt(dx^2 + dy^2)
 
-    -- Stay close to mob (within 3 units)
-    if distance > 3 then
-        windower.ffxi.run(true)
+    -- prevent getting hung on a player target.
+    if target.spawn_type ~= 16 then
+        windower.send_command('input /lockon;wait. 2;setkey escape down;wait .2;setkey escape up')
+        return
+    end
+
+    -- Stay close to mob (within ~3.4 yalms)
+    if distance > 3.4 then
+        windower.ffxi.run(true) -- engaged-run remains camera-forward; fine for combat micro
     else
         windower.ffxi.run(false)
 
         -- Correct facing
-		local player_body = windower.ffxi.get_mob_by_id(player.id)
-		local angle = (math.atan2((target.y - player_body.y), (target.x - player_body.x))*180/math.pi)*-1
-		local rads = angle:radian()
-		windower.ffxi.turn(rads)
+        local player_body = windower.ffxi.get_mob_by_id(player.id)
+        local angle = (math.atan2((target.y - player_body.y), (target.x - player_body.x))*180/math.pi)*-1
+        local rads = angle:radian()
+        windower.ffxi.turn(rads)
     end
 end
 
@@ -231,18 +237,18 @@ local function check_for_nearby_threats()
     if not player then return false end
 
     local nearest = nil
-    local shortest = hunt_range  -- 4 yalms range cap
+    local shortest = hunt_range
 
     for _, mob in pairs(windower.ffxi.get_mob_array()) do
-		if mob and mob.id ~= player.id and mob.is_npc and mob.valid_target and mob.hpp > 0 and mob.claim_id == 0 and mob.spawn_type == 16 then
-			local dx = mob.x - player.x
-			local dy = mob.y - player.y
-			local dist = math.sqrt(dx^2 + dy^2)
-			if dist <= shortest then
-				nearest = mob
-				shortest = dist
-			end
-		end
+        if mob and mob.id ~= player.id and mob.is_npc and mob.valid_target and mob.hpp > 0 and mob.claim_id == 0 and mob.spawn_type == 16 then
+            local dx = mob.x - player.x
+            local dy = mob.y - player.y
+            local dist = math.sqrt(dx^2 + dy^2)
+            if dist <= shortest then
+                nearest = mob
+                shortest = dist
+            end
+        end
     end
 
     if nearest then
@@ -251,50 +257,141 @@ local function check_for_nearby_threats()
             local dy = nearest.y - camp_point.y
             local camp_dist = math.sqrt(dx^2 + dy^2)
             if camp_dist > camp_range then
-                --windower.add_to_chat(123, 'Hunter: Skipped threat (outside camp range).')
                 return false
             end
         end
-    TargetEngage(nearest.id)
-        windower.add_to_chat(207, 'Hunter: Engaging nearby threat: '..nearest.name)
+        TargetEngage(nearest.id)
         return true
     end
 
     return false
 end
 
+--============================--
+-- Absolute-heading run helpers (straight-line return)
+--============================--
+local function stop_run()
+    windower.ffxi.run(false)
+    moving_forward = false
+end
+
+local function run_towards(tx, ty)
+    local me = windower.ffxi.get_mob_by_id(windower.ffxi.get_player().id)
+    if not me then return end
+    local dy = ty - me.y
+    local dx = tx - me.x
+    -- Match your working addon: heading in radians is *negative* atan2(dy, dx)
+    local rads = -math.atan2(dy, dx)
+    windower.ffxi.run(rads)
+    moving_forward = true
+end
+
+--============================--
+-- Straight-line return controller
+--============================--
+function RepositionTo(tx, ty)
+    if reposition_running then return end
+    reposition_running = true
+
+	stop_run()
+    movement_token = movement_token + 1
+    local token = movement_token
+
+    while token == movement_token do
+        local player = windower.ffxi.get_player()
+        if not player then break end
+        local me = windower.ffxi.get_mob_by_id(player.id)
+        if not me then break end
+
+        local dx, dy = tx - me.x, ty - me.y
+        local dist = math.sqrt(dx*dx + dy*dy)
+        local now  = os.clock()
+
+        -- Arrival: stop and honor cooldown to prevent immediate re-accel
+        if dist <= ARRIVAL_RADIUS then
+            if moving_forward then stop_run() end
+            if now - last_stop_ts < STOP_COOLDOWN then
+                coroutine.sleep(POLL_INTERVAL)
+            else
+                last_stop_ts = now
+                break
+            end
+
+        -- Brake zone: inside hysteresis band → ensure full stop
+        elseif dist <= START_RADIUS then
+            if moving_forward then
+                stop_run()
+                last_stop_ts = now
+            end
+            coroutine.sleep(POLL_INTERVAL)
+
+        -- Outside start radius: run straight toward the point (absolute heading)
+        else
+            if (now - last_stop_ts) >= STOP_COOLDOWN then
+                run_towards(tx, ty)
+            else
+                if moving_forward then stop_run() end
+            end
+            coroutine.sleep(POLL_INTERVAL)
+        end
+    end
+
+    -- Safety: guarantee stop if another routine stole the token
+    if moving_forward and token ~= movement_token then
+        stop_run()
+    end
+
+    reposition_running = false -- release single-owner lock
+end
+
+--============================--
+-- Hunt loop
+--============================--
 local function hunt_loop()
-    coroutine.sleep(.5)
+    coroutine.sleep(1)
     while TheHuntIsOn do
         local player = windower.ffxi.get_player()
+		
+		if player and player.status == 1 and reposition_running then
+			movement_token = movement_token + 1   -- tell RepositionTo to wind down
+		end
+		
         if player and player.status == 1 then
             maintain_position_and_facing()
         elseif not check_for_nearby_threats() then
             HunterEngage()
         end
 
-        -- Return-to-position logic
+        -- Return-to-position logic (non-blocking, hysteresis-controlled)
         if ret_active and player and player.status == 0 and start_position.x and start_position.y then
-            local player_body = windower.ffxi.get_mob_by_id(player.id)
-            if player_body then
-                local dx = start_position.x - player_body.x
-                local dy = start_position.y - player_body.y
-                local distance = math.sqrt(dx^2 + dy^2)
-                if distance > 4 then
-                    Reposition(true)
-					coroutine.sleep(0.2) 
-                elseif returning then
-                    Reposition(false)
+            local me = windower.ffxi.get_mob_by_id(player.id)
+            if me then
+                local dx = start_position.x - me.x
+                local dy = start_position.y - me.y
+                local distance = math.sqrt(dx*dx + dy*dy)
+
+                -- Start a reposition job if we're outside the start radius and not already running
+                if distance > START_RADIUS and not reposition_running then
+                    returning = true
+                    coroutine.schedule(function()
+                        RepositionTo(start_position.x, start_position.y)
+                        returning = false
+                    end, 0)
+                end
+
+                -- If we're back inside the arrival radius, cancel any active job
+                if distance <= ARRIVAL_RADIUS then
+                    movement_token = movement_token + 1 -- wind down any active job
                 end
             end
         end
 
-        coroutine.sleep(1.5)
+        coroutine.sleep(0.3)
     end
 end
 
 local function prowl_loop()
-    
+    -- reserved for future A↔B prowl behavior
 end
 
 --============================--
@@ -306,8 +403,8 @@ windower.register_event('prerender', function()
         return -- skip until 0.5s passes
     end
     last_update = now
-	
-	-- Tracked mobs overlay (if tracking is active)
+
+    -- Tracked mobs overlay (if tracking is active)
     if tracking_active then
         local player = windower.ffxi.get_player()
         if player then
@@ -329,23 +426,23 @@ windower.register_event('prerender', function()
             table.sort(mobs_in_range, function(a, b) return a.id < b.id end)
 
             local lines = {}
-			table.insert(lines, COLOR_WHITE .. "HUNTER-TRACKER" .. COLOR_RESET)
+            table.insert(lines, COLOR_WHITE .. "HUNTER- Now tracking" .. COLOR_RESET)
             for _, mob in ipairs(mobs_in_range) do
-				local color = get_mob_color(mob, player.id)
-				local hex_index = string.format("%03X", mob.index)
+                local color = get_mob_color(mob, player.id)
+                local hex_index = string.format("%03X", mob.index)
 
-				if target and target.id == mob.id then
-					table.insert(lines, string.format("%s%s%s: %d (%s) %s%s<<<%s",
-						COLOR_RESET,
-						color, mob.name, mob.id, hex_index, COLOR_RESET,
-						COLOR_YELLOW, COLOR_RESET
-					))
-				else
-					table.insert(lines, string.format("%s%s: %d (%s)%s",
-						color, mob.name, mob.id, hex_index, COLOR_RESET
-					))
-				end
-			end
+                if target and target.id == mob.id then
+                    table.insert(lines, string.format("%s%s%s: %d (%s) %s%s<<<%s",
+                        COLOR_RESET,
+                        color, hex_index, mob.id, mob.name, COLOR_RESET,
+                        COLOR_YELLOW, COLOR_RESET
+                    ))
+                else
+                    table.insert(lines, string.format("%s%s: %d (%s)%s   ",
+                        color, hex_index, mob.id, mob.name, COLOR_RESET
+                    ))
+                end
+            end
 
             if #lines > 0 then
                 tracker_display:text(table.concat(lines, '\n'))
@@ -361,16 +458,14 @@ windower.register_event('prerender', function()
     local player = windower.ffxi.get_player()
     if not player then return end
 
-    --local display_lines = {COLOR_WHITE .. 'Marked Prey' .. COLOR_RESET}
     local valid_mobs = {}
-	local header
-	local display_lines = {}
+    local display_lines = {}
     if TheHuntIsOn then
         table.insert(display_lines, COLOR_GREEN .. 'HUNTER On the hunt!' .. COLOR_RESET)
     else
         table.insert(display_lines, COLOR_WHITE .. 'HUNTER Standing By' .. COLOR_RESET)
     end
-	table.insert(display_lines, COLOR_WHITE .. 'Hunt (' .. hunt_range .. ') Yalms' .. COLOR_RESET)
+    table.insert(display_lines, COLOR_WHITE .. 'Hunt (' .. hunt_range .. ') Yalms' .. COLOR_RESET)
 
     if is_camped then
         table.insert(display_lines,
@@ -393,8 +488,8 @@ windower.register_event('prerender', function()
             )
         )
     end
-	
-	-- Return-to-position status
+
+    -- Return-to-position status
     if ret_active then
         table.insert(display_lines,
             string.format("%sReturn-to-Position:%s [%sON%s]",
@@ -409,7 +504,6 @@ windower.register_event('prerender', function()
         )
     end
 
-
     for i = 1, #prey do
         local mob = windower.ffxi.get_mob_by_id(prey[i])
         if mob then table.insert(valid_mobs, mob) end
@@ -420,15 +514,11 @@ windower.register_event('prerender', function()
     for _, mob in ipairs(valid_mobs) do
         local color = get_mob_color(mob, player.id)
         local hex_index = string.format("%03X", mob.index)
-		table.insert(display_lines, string.format("%s%s: %d (%s)%s", color, mob.name, mob.id, hex_index, COLOR_RESET))
+        table.insert(display_lines, string.format("%s%s: %d (%s)%s", color, mob.name, mob.id, hex_index, COLOR_RESET))
     end
 
-    --if #valid_mobs > 0 then
-        prey_display:text(table.concat(display_lines, '\n'))
-        prey_display:show()
-    --else
-        --prey_display:hide()
-    --end
+    prey_display:text(table.concat(display_lines, '\n'))
+    prey_display:show()
 end)
 
 --============================--
@@ -448,7 +538,6 @@ end
 --============================--
 -- Other Register Events
 --============================--
-
 windower.register_event('zone change', function()
     -- Break camp
     camp_point = nil
@@ -456,9 +545,6 @@ windower.register_event('zone change', function()
 
     -- Disable hunt
     TheHuntIsOn = false
-
-    -- Optional: feedback to player
-    --windower.add_to_chat(8, '[Hunter] Zone change detected. Camp cleared and hunt disabled.')
 end)
 
 --============================--
@@ -469,44 +555,43 @@ windower.register_event('addon command', function(cmd, ...)
     cmd = cmd and cmd:lower() or nil
 
     if not cmd or cmd == '' then
-		TheHuntIsOn = not TheHuntIsOn
-		windower.add_to_chat(200, '[Hunter] The hunt ' .. (TheHuntIsOn and 'is on!.' or 'is called off.'))
+        TheHuntIsOn = not TheHuntIsOn
+        windower.add_to_chat(200, '[Hunter] The hunt ' .. (TheHuntIsOn and 'is on!.' or 'is called off.'))
 
-		if TheHuntIsOn then
-			coroutine.schedule(hunt_loop, 0)
-		end
-		return
-	end
+        if TheHuntIsOn then
+            coroutine.schedule(hunt_loop, 0)
+        end
+        return
+    end
 
     if tonumber(cmd) and tonumber(cmd) >= 1 and tonumber(cmd) <= 20 then
         prey_count = tonumber(cmd)
         prey = {}
         for i = 1, prey_count do prey[i] = nil end
         windower.add_to_chat(200, '[Hunter] Prey list size set to ' .. prey_count)
-		populate_prey_from_target()
-		tracking_active = false
+        populate_prey_from_target()
+        tracking_active = false
 
     elseif cmd == 'mark' or cmd == 'm' then
         if prey_count == 0 then
             windower.add_to_chat(123, '[Hunter] Set prey list size first.')
         else
             populate_prey_from_target()
-			tracking_active = false
+            tracking_active = false
         end
 
     elseif cmd == 'hunt' then
         HunterEngage()
-		
-	elseif (cmd == 'range' or cmd == 'r' or cmd == 'rng') and tonumber(args[1]) then
-		local value = tonumber(args[1])
-		if value >= 1 and value <= 30 then
-			hunt_range = value
-			windower.add_to_chat(200, '[Hunter] Defensive detection range set to ' .. hunt_range .. ' yalms.')
-		else
-			windower.add_to_chat(123, '[Hunter] Please enter a number between 1 and 25.')
-		end
-		
-    
+
+    elseif (cmd == 'range' or cmd == 'r' or cmd == 'rng') and tonumber(args[1]) then
+        local value = tonumber(args[1])
+        if value >= 1 and value <= 30 then
+            hunt_range = value
+            windower.add_to_chat(200, '[Hunter] Defensive detection range set to ' .. hunt_range .. ' yalms.')
+        else
+            windower.add_to_chat(123, '[Hunter] Please enter a number between 1 and 25.')
+        end
+
     elseif cmd == 'camp' or cmd == 'c' then
         local p = windower.ffxi.get_mob_by_id(windower.ffxi.get_player().id)
         if p then
@@ -514,13 +599,13 @@ windower.register_event('addon command', function(cmd, ...)
             is_camped = true
             windower.add_to_chat(200, '[Hunter] Camp point set.')
         end
-		
-	elseif cmd == 'ret' or cmd == 'return' then
-		ret_active = not ret_active
-		windower.add_to_chat(200, '[Hunter] Return-to-position is now ' .. (ret_active and 'ENABLED' or 'DISABLED') .. '.')
 
-	elseif cmd == 'setpos' or cmd == 'setposition' then
-		set_position()	
+    elseif cmd == 'ret' or cmd == 'return' then
+        ret_active = not ret_active
+        windower.add_to_chat(200, '[Hunter] Return-to-position is now ' .. (ret_active and 'ENABLED' or 'DISABLED') .. '.')
+
+    elseif cmd == 'setpos' or cmd == 'setposition' then
+        set_position()
 
     elseif cmd == 'break' then
         camp_point = nil
@@ -536,10 +621,10 @@ windower.register_event('addon command', function(cmd, ...)
             windower.add_to_chat(123, '[Hunter] Enter a number between 1 and 40.')
         end
 
-	elseif cmd == 'track' or cmd == 't' then
-		tracking_active = not tracking_active
-		windower.add_to_chat(200, '[Hunter] Tracking mode ' .. (tracking_active and 'ENABLED' or 'DISABLED') .. '. Use "//hunt t" to toggle.')
-		windower.add_to_chat(200, '[Hunter] Mark a target with the "m" or "#".')
+    elseif cmd == 'track' or cmd == 't' then
+        tracking_active = not tracking_active
+        windower.add_to_chat(200, '[Hunter] Tracking mode ' .. (tracking_active and 'ENABLED' or 'DISABLED') .. '. Use "//hunt t" to toggle.')
+        windower.add_to_chat(200, '[Hunter] Mark a target with the "m" or "#".')
 
     elseif cmd == 'display' or cmd =='d' then
         settings.table_display = not settings.table_display
@@ -548,14 +633,12 @@ windower.register_event('addon command', function(cmd, ...)
 
     elseif cmd == '?' then
         windower.add_to_chat(123, 'Hunter Commands:')
-		windower.add_to_chat(123, '//hunter or //hunt	- Begin/Stop hunt loop')
-        windower.add_to_chat(123, '//hunter <1-20> 	- Marks target & Set prey list size')
-		windower.add_to_chat(123, '//hunter range <1-30> - (r #) Set auto-engage range')
-        windower.add_to_chat(123, '//hunter track    - (t) Tracks all targets within your camp range')
-        windower.add_to_chat(123, '//hunter display  - (d) Toggle small overlay')
-		windower.add_to_chat(123, '//hunter camp  	- (c) Set & enable camp radius by current X/Y position')
-		windower.add_to_chat(123, '//hunter camprange <1-30> - (cr #) Set camping range')
+        windower.add_to_chat(123, '//hunter or //hunt  - Begin/Stop hunt loop')
+        windower.add_to_chat(123, '//hunter <1-20>     - Marks current target & Set prey list size')
+        windower.add_to_chat(123, '//hunter range <1-30> - (r #) Set auto-engage range')
+        windower.add_to_chat(123, '//hunter track      - (t) Tracks all targets within your camp range')
+        windower.add_to_chat(123, '//hunter display    - (d) Toggle small overlay')
+        windower.add_to_chat(123, '//hunter camp       - (c) Set & enable camp radius by current X/Y position')
+        windower.add_to_chat(123, '//hunter camprange <1-30> - (cr #) Set camping range')
     end
 end)
----------
----------
