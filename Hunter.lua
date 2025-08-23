@@ -1,4 +1,4 @@
--- Hunter Addon - Full Version with Prey Tracking and Overlay
+-- Hunter Addon -
 
 _addon.name = 'Hunter'
 _addon.author = 'Paulu'
@@ -39,7 +39,7 @@ local point_b = nil
 local prowl_active = false
 local current_target_point = nil
 local camp_point = nil
-local camp_range = 25
+local camp_range = 22
 local is_camped = false
 local tracking_active = false
 local last_update = 0
@@ -290,7 +290,7 @@ end
 -- Straight-line return controller
 --============================--
 function RepositionTo(tx, ty)
-    if reposition_running then return end
+	if reposition_running then return end
     reposition_running = true
 
 	stop_run()
@@ -363,7 +363,7 @@ local function hunt_loop()
         end
 
         -- Return-to-position logic (non-blocking, hysteresis-controlled)
-        if ret_active and player and player.status == 0 and start_position.x and start_position.y then
+        if TheHuntIsOn and ret_active and player and player.status == 0 and start_position.x and start_position.y then
             local me = windower.ffxi.get_mob_by_id(player.id)
             if me then
                 local dx = start_position.x - me.x
@@ -535,6 +535,23 @@ local function set_position()
     end
 end
 
+local function set_hunt_state(on)
+    if on then
+        TheHuntIsOn = true
+        windower.add_to_chat(207, '[Hunter] Hunt: ON')
+    else
+        -- hard stop everything right now
+        TheHuntIsOn = false
+        if returning then
+            Reposition(false)
+        end
+        windower.ffxi.run(false)   -- belt-and-suspenders: ensure movement stops
+        returning  = false
+        -- (optional) ret_active = false  -- uncomment if you want to fully disable return mode too
+        windower.add_to_chat(207, '[Hunter] Hunt: OFF')
+    end
+end
+
 --============================--
 -- Other Register Events
 --============================--
@@ -555,14 +572,21 @@ windower.register_event('addon command', function(cmd, ...)
     cmd = cmd and cmd:lower() or nil
 
     if not cmd or cmd == '' then
-        TheHuntIsOn = not TheHuntIsOn
-        windower.add_to_chat(200, '[Hunter] The hunt ' .. (TheHuntIsOn and 'is on!.' or 'is called off.'))
+    TheHuntIsOn = not TheHuntIsOn
 
-        if TheHuntIsOn then
-            coroutine.schedule(hunt_loop, 0)
-        end
-        return
-    end
+		if TheHuntIsOn then
+			windower.add_to_chat(200, '[Hunter] The hunt is on!.')
+			coroutine.schedule(hunt_loop, 0)
+		else
+			windower.add_to_chat(200, '[Hunter] The hunt is called off.')
+			-- hard stop movement
+			windower.ffxi.run(false)
+			returning  = false
+			-- ret_active = false -- optional: reset return-to-position state
+		end
+
+		return
+	end
 
     if tonumber(cmd) and tonumber(cmd) >= 1 and tonumber(cmd) <= 20 then
         prey_count = tonumber(cmd)
@@ -593,15 +617,20 @@ windower.register_event('addon command', function(cmd, ...)
         end
 
     elseif cmd == 'camp' or cmd == 'c' then
-        local p = windower.ffxi.get_mob_by_id(windower.ffxi.get_player().id)
-        if p then
-            camp_point = {x = p.x, y = p.y}
-            is_camped = true
-            windower.add_to_chat(200, '[Hunter] Camp point set.')
-        end
+        if is_camped then
+			windower.send_command('hunt break')
+		else
+			local p = windower.ffxi.get_mob_by_id(windower.ffxi.get_player().id)
+			if p then
+				camp_point = {x = p.x, y = p.y}
+				is_camped = true
+				windower.add_to_chat(200, '[Hunter] Camp point set. Camp range is '.. camp_range ..' yalms.')
+			end
+		end
 
     elseif cmd == 'ret' or cmd == 'return' then
-        ret_active = not ret_active
+        
+		ret_active = not ret_active
         windower.add_to_chat(200, '[Hunter] Return-to-position is now ' .. (ret_active and 'ENABLED' or 'DISABLED') .. '.')
 
     elseif cmd == 'setpos' or cmd == 'setposition' then
@@ -635,10 +664,10 @@ windower.register_event('addon command', function(cmd, ...)
         windower.add_to_chat(123, 'Hunter Commands:')
         windower.add_to_chat(123, '//hunter or //hunt  - Begin/Stop hunt loop')
         windower.add_to_chat(123, '//hunter <1-20>     - Marks current target & Set prey list size')
-        windower.add_to_chat(123, '//hunter range <1-30> - (r #) Set auto-engage range')
+        windower.add_to_chat(123, '//hunter range <1-40> - (r #) Set auto-engage range')
         windower.add_to_chat(123, '//hunter track      - (t) Tracks all targets within your camp range')
         windower.add_to_chat(123, '//hunter display    - (d) Toggle small overlay')
-        windower.add_to_chat(123, '//hunter camp       - (c) Set & enable camp radius by current X/Y position')
-        windower.add_to_chat(123, '//hunter camprange <1-30> - (cr #) Set camping range')
+        windower.add_to_chat(123, '//hunter camp       - (c) Toggle enable camp radius by set X/Y position')
+        windower.add_to_chat(123, '//hunter camprange <1-40> - (cr #) Set camping range')
     end
 end)
